@@ -6,6 +6,7 @@
 #include <vector>
 #include <ctime>
 #include <shellapi.h>
+#include <wtsapi32.h>
 
 #include <algorithm>
 #include <atomic>
@@ -62,7 +63,8 @@ enum ControlId
     IDC_SAT,
     IDC_SUN,
     IDC_OPEN_LOG,
-    IDC_THEME
+    IDC_THEME,
+    IDC_PROFILE
 };
 
 // ============================================================
@@ -84,12 +86,20 @@ enum ControlId
 #define ID_TRAY_TEST  2005
 #define ID_TRAY_ABOUT 2006
 #define ID_TRAY_OPEN_LOG 2007
+#define ID_TRAY_PAUSE_FULLSCREEN 2008
+#define ID_TRAY_PROFILE_WORK 2009
+#define ID_TRAY_PROFILE_PRESENTATION 2010
+#define ID_TRAY_PROFILE_GAMING 2011
 
 // ============================================================
 // Global variables
 // ============================================================
 
 static HWND g_hwnd = nullptr;
+
+static std::atomic<int> g_remainingSeconds{-1};
+static std::atomic<bool> g_sessionLocked{false};
+static std::atomic<bool> g_powerSuspended{false};
 
 static HWND g_startTime = nullptr;
 static HWND g_endTime = nullptr;
@@ -122,7 +132,11 @@ static HFONT g_fontClassic = nullptr;
 static HFONT g_fontClassicTitle = nullptr;
 static HFONT g_fontMatrix = nullptr;
 static HFONT g_fontMatrixTitle = nullptr;
+static HFONT g_fontMatrixOptions = nullptr;
 static HWND g_themeUi = nullptr;
+static HWND g_profileUi = nullptr;
+static HWND g_profileLabelUi = nullptr;
+static int g_activeProfile = 0;
 static HWND g_footerUi = nullptr;
 static bool g_matrixTheme = false;
 static HICON g_trayClassicActive = nullptr;
@@ -293,6 +307,18 @@ std::wstring GetControlText(HWND hwnd);
 bool ParseTime(const std::wstring& value, int& minutes);
 void SaveSettings(bool running);
 
+void ApplyProfile(int profile, bool save);
+void UpdateProfileUi();
+std::wstring GetProfileName(int profile);
+std::wstring GetProfileDisplayName(int profile);
+void SaveCurrentProfileSettings();
+void LoadProfileSettings(int profile);
+
+// Used by ApplyProfile(); implementations are located later in this file.
+void SetKeepAwake(bool enable);
+void SetAutoStart(bool enable);
+void WriteLog(const std::wstring& message);
+void UpdateTrayTooltip();
 void UpdateTrayIconForState();
 void DestroyDynamicTrayIcons();
 void ApplyTheme();
@@ -380,6 +406,7 @@ void UpdateLanguage()
                 : L"MATRIX"
         );
 
+    UpdateProfileUi();
     UpdateStats();
 
     UpdateKeepAwakeIndicator();
@@ -957,18 +984,231 @@ void DestroyDynamicTrayIcons()
 
 
 // ============================================================
+// Operating profiles - Mouse Mover 2.3
+// ============================================================
+
+std::wstring GetProfileName(int profile)
+{
+    switch (profile)
+    {
+        case 1: return L"PRESENTATION";
+        case 2: return L"GAMING";
+        default: return L"WORK";
+    }
+}
+
+std::wstring GetProfileDisplayName(int profile)
+{
+    if (g_english)
+        return GetProfileName(profile);
+
+    switch (profile)
+    {
+        case 1: return L"PREZENTACE";
+        case 2: return L"HRANÍ";
+        default: return L"PRÁCE";
+    }
+}
+
+void UpdateProfileUi()
+{
+    if (g_profileUi)
+    {
+        SendMessageW(g_profileUi, CB_RESETCONTENT, 0, 0);
+
+        for (int i = 0; i < 3; ++i)
+        {
+            std::wstring name = GetProfileDisplayName(i);
+            SendMessageW(
+                g_profileUi,
+                CB_ADDSTRING,
+                0,
+                reinterpret_cast<LPARAM>(name.c_str())
+            );
+        }
+
+        SendMessageW(g_profileUi, CB_SETCURSEL, g_activeProfile, 0);
+    }
+
+    if (g_profileLabelUi)
+        SetWindowTextW(g_profileLabelUi, T(L"Profil:", L"Profile:"));
+}
+
+void SaveCurrentProfileSettings()
+{
+    if (!g_hwnd || !g_startTime || !g_endTime || !g_interval || !g_pixels)
+        return;
+
+    const std::wstring path = GetSettingsPath();
+    const std::wstring section = L"Profile." + GetProfileName(g_activeProfile);
+
+    auto writeText = [&](const wchar_t* key, HWND control)
+    {
+        WritePrivateProfileStringW(
+            section.c_str(), key, GetControlText(control).c_str(), path.c_str());
+    };
+
+    auto writeBool = [&](const wchar_t* key, int id)
+    {
+        WritePrivateProfileStringW(
+            section.c_str(), key,
+            IsDlgButtonChecked(g_hwnd, id) == BST_CHECKED ? L"1" : L"0",
+            path.c_str());
+    };
+
+    writeText(L"StartTime", g_startTime);
+    writeText(L"EndTime", g_endTime);
+    writeText(L"Interval", g_interval);
+    writeText(L"Pixels", g_pixels);
+
+    writeBool(L"AutoStart", IDC_AUTOSTART);
+    writeBool(L"Tray", IDC_TRAYOPTION);
+    writeBool(L"PreventSleep", IDC_PREVENT_SLEEP);
+    writeBool(L"KeepDisplay", IDC_KEEP_DISPLAY);
+    writeBool(L"PauseFullscreen", IDC_PAUSE_FULLSCREEN);
+    writeBool(L"Logging", IDC_LOGGING);
+
+    const wchar_t* dayKeys[7] =
+        {L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat", L"Sun"};
+
+    for (int i = 0; i < 7; ++i)
+    {
+        if (g_dayChecks[i])
+        {
+            WritePrivateProfileStringW(
+                section.c_str(), dayKeys[i],
+                SendMessageW(g_dayChecks[i], BM_GETCHECK, 0, 0) == BST_CHECKED
+                    ? L"1" : L"0",
+                path.c_str());
+        }
+    }
+
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
+}
+
+void LoadProfileSettings(int profile)
+{
+    if (profile < 0 || profile > 2)
+        profile = 0;
+
+    const std::wstring path = GetSettingsPath();
+    const std::wstring section = L"Profile." + GetProfileName(profile);
+
+    // For old installations, use the former global settings as migration
+    // defaults. If they do not exist, use normal application defaults.
+    auto globalText = [&](const wchar_t* key, const wchar_t* fallback)
+    {
+        wchar_t value[128]{};
+        GetPrivateProfileStringW(
+            L"MouseMover", key, fallback, value, 128, path.c_str());
+        return std::wstring(value);
+    };
+
+    auto globalBool = [&](const wchar_t* key, bool fallback)
+    {
+        wchar_t value[16]{};
+        GetPrivateProfileStringW(
+            L"MouseMover", key, fallback ? L"1" : L"0",
+            value, 16, path.c_str());
+        return _wtoi(value) != 0;
+    };
+
+    auto loadText = [&](const wchar_t* key, HWND control,
+                        const std::wstring& fallback)
+    {
+        wchar_t value[128]{};
+        GetPrivateProfileStringW(
+            section.c_str(), key, fallback.c_str(),
+            value, 128, path.c_str());
+        SetWindowTextW(control, value);
+    };
+
+    auto loadBool = [&](const wchar_t* key, int id, bool fallback)
+    {
+        wchar_t value[16]{};
+        GetPrivateProfileStringW(
+            section.c_str(), key, fallback ? L"1" : L"0",
+            value, 16, path.c_str());
+        CheckDlgButton(
+            g_hwnd, id, _wtoi(value) != 0 ? BST_CHECKED : BST_UNCHECKED);
+    };
+
+    loadText(L"StartTime", g_startTime, globalText(L"StartTime", L"08:00"));
+    loadText(L"EndTime", g_endTime, globalText(L"EndTime", L"17:30"));
+    loadText(L"Interval", g_interval, globalText(L"Interval", L"30"));
+    loadText(L"Pixels", g_pixels, globalText(L"Pixels", L"10"));
+
+    loadBool(L"AutoStart", IDC_AUTOSTART, globalBool(L"AutoStart", false));
+    loadBool(L"Tray", IDC_TRAYOPTION, globalBool(L"Tray", true));
+    loadBool(L"PreventSleep", IDC_PREVENT_SLEEP, globalBool(L"PreventSleep", true));
+    loadBool(L"KeepDisplay", IDC_KEEP_DISPLAY, globalBool(L"KeepDisplay", true));
+    loadBool(L"PauseFullscreen", IDC_PAUSE_FULLSCREEN, globalBool(L"PauseFullscreen", false));
+    loadBool(L"Logging", IDC_LOGGING, globalBool(L"Logging", false));
+
+    const wchar_t* dayKeys[7] =
+        {L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat", L"Sun"};
+
+    for (int i = 0; i < 7; ++i)
+    {
+        if (!g_dayChecks[i])
+            continue;
+
+        bool fallback = globalBool(dayKeys[i], true);
+        wchar_t value[16]{};
+        GetPrivateProfileStringW(
+            section.c_str(), dayKeys[i], fallback ? L"1" : L"0",
+            value, 16, path.c_str());
+
+        SendMessageW(
+            g_dayChecks[i], BM_SETCHECK,
+            _wtoi(value) != 0 ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+
+    // Autostart is a Windows-wide registry setting, so switching profile
+    // immediately applies the selected profile's AutoStart preference.
+    SetAutoStart(
+        IsDlgButtonChecked(g_hwnd, IDC_AUTOSTART) == BST_CHECKED);
+}
+
+void ApplyProfile(int profile, bool save)
+{
+    if (profile < 0 || profile > 2)
+        profile = 0;
+
+    // Save manual changes of the profile that is being left.
+    if (save && profile != g_activeProfile)
+        SaveCurrentProfileSettings();
+
+    g_activeProfile = profile;
+
+    // Restore ALL values belonging to this profile.
+    LoadProfileSettings(g_activeProfile);
+    UpdateProfileUi();
+    UpdateLanguage();
+    UpdateKeepAwakeIndicator();
+
+    if (g_running)
+        SetKeepAwake(true);
+
+    if (save)
+        SaveSettings(g_running);
+
+    WriteLog(
+        T(L"Aktivní profil: ", L"Active profile: ") +
+        GetProfileDisplayName(g_activeProfile));
+
+    UpdateTrayTooltip();
+}
+
+// ============================================================
 // Theme support: Classic / Matrix
 // ============================================================
 
 void SaveThemeSetting()
 {
-    std::wstring path = GetSettingsPath();
-    WritePrivateProfileStringW(
-        L"MouseMover",
-        L"Theme",
-        g_matrixTheme ? L"Matrix" : L"Classic",
-        path.c_str()
-    );
+    // Theme is part of the complete atomic settings transaction.
+    if (g_hwnd)
+        SaveSettings(g_running);
 }
 
 void LoadThemeSetting()
@@ -1014,6 +1254,13 @@ void ApplyTheme()
             DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Consolas");
 
+    // Slightly smaller Matrix font for long two-column option labels.
+    if (!g_fontMatrixOptions)
+        g_fontMatrixOptions = CreateFontW(
+            -14,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
+            DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Consolas");
+
     if (g_themeWindowBrush)
     {
         DeleteObject(g_themeWindowBrush);
@@ -1047,6 +1294,23 @@ void ApplyTheme()
     if (g_titleUi)
         SendMessageW(g_titleUi, WM_SETFONT,
             reinterpret_cast<WPARAM>(titleFont), TRUE);
+
+    // The Czech Matrix labels are longer than their English equivalents.
+    // Use a dedicated font here so the full captions remain visible without
+    // disturbing the rest of the Matrix layout.
+    HFONT optionFont = g_matrixTheme ? g_fontMatrixOptions : g_fontClassic;
+    HWND optionControls[] = {
+        g_preventSleepUi,
+        g_keepDisplayUi,
+        g_pauseFullscreenUi,
+        g_loggingUi
+    };
+    for (HWND control : optionControls)
+    {
+        if (control)
+            SendMessageW(control, WM_SETFONT,
+                reinterpret_cast<WPARAM>(optionFont), TRUE);
+    }
 
     if (g_footerUi)
     {
@@ -1216,6 +1480,45 @@ void WriteLog(const std::wstring& message)
       << message << L"\n";
 }
 
+std::wstring GetForegroundWindowDiagnostic()
+{
+    HWND fg = GetForegroundWindow();
+    if (!fg)
+        return L"foreground=<none>";
+
+    wchar_t title[256]{};
+    GetWindowTextW(fg, title, 256);
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+
+    std::wstring processName = L"<unknown>";
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process)
+    {
+        wchar_t path[MAX_PATH]{};
+        DWORD size = MAX_PATH;
+        if (QueryFullProcessImageNameW(process, 0, path, &size))
+            processName = std::filesystem::path(path).filename().wstring();
+        CloseHandle(process);
+    }
+
+    RECT wr{};
+    GetWindowRect(fg, &wr);
+
+    HMONITOR mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(mon, &mi);
+
+    std::wstringstream ss;
+    ss << L"process=" << processName
+       << L", title=\"" << title << L"\""
+       << L", window=" << (wr.right-wr.left) << L"x" << (wr.bottom-wr.top)
+       << L", monitor=" << (mi.rcMonitor.right-mi.rcMonitor.left)
+       << L"x" << (mi.rcMonitor.bottom-mi.rcMonitor.top);
+    return ss.str();
+}
+
 bool IsFullscreenForeground()
 {
     HWND fg = GetForegroundWindow();
@@ -1320,12 +1623,28 @@ void UpdateStats()
     SetWindowTextW(g_statsUi, b);
 }
 
+std::wstring FormatMMSS(int seconds);
+
 void UpdateTrayTooltip()
 {
     if (!g_nid.hWnd) return;
-    std::wstring tip = g_running
-        ? T(L"Mouse Mover • AKTIVNÍ", L"Mouse Mover • ACTIVE")
-        : T(L"Mouse Mover • VYPNUTO", L"Mouse Mover • STOPPED");
+    std::wstring tip;
+    if (!g_running)
+    {
+        tip = T(L"Mouse Mover • VYPNUTO", L"Mouse Mover • STOPPED");
+    }
+    else if (g_sessionLocked)
+    {
+        tip = T(L"Mouse Mover • ZAMKNUTO • PAUZA", L"Mouse Mover • LOCKED • PAUSED");
+    }
+    else
+    {
+        int remaining = g_remainingSeconds.load();
+        tip = T(L"Mouse Mover • AKTIVNÍ", L"Mouse Mover • ACTIVE");
+        tip += L" • " + GetProfileDisplayName(g_activeProfile);
+        if (remaining >= 0)
+            tip += L" • " + FormatMMSS(remaining);
+    }
     wcsncpy_s(g_nid.szTip, tip.c_str(), _TRUNCATE);
     g_nid.uFlags = NIF_TIP | NIF_MESSAGE | NIF_ICON;
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
@@ -1412,7 +1731,13 @@ void ShowAbout()
         L"• Plánování aktivního času programu.\n"
         L"• Výběr aktivních dnů Po–Ne.\n"
         L"• Podpora časového intervalu přes půlnoc.\n"
-        L"• Volitelné pozastavení automatického pohybu a odpočtu ve fullscreen aplikaci.\n"
+        L"• Vylepšená detekce fullscreen/borderless/F11 a pozastavení odpočtu.\n"
+        L"• Automatická pauza při zamknutí Windows a obnova po odemknutí.\n"
+        L"• Korektní reakce na suspend/resume Windows.\n"
+        L"• Atomické ukládání nastavení proti poškození INI souboru.\n"
+        L"• Rozšířený tray stav, countdown a fullscreen přepínač.\n"
+        L"• Profily PRÁCE / PREZENTACE / HRANÍ s rychlým přepínáním.\n"
+        L"• Aktivní profil se ukládá a lze jej měnit také z tray menu.\n"
         L"• Testovací pohyb kurzoru bez čekání na interval.\n"
         L"• START / STOP bez ukončení programu.\n"
         L"• Minimalizace do system tray.\n"
@@ -1454,7 +1779,13 @@ void ShowAbout()
         L"• Configurable active time schedule.\n"
         L"• Selectable active days Monday–Sunday.\n"
         L"• Active time ranges across midnight are supported.\n"
-        L"• Optional automatic movement and countdown pause in fullscreen applications.\n"
+        L"• Improved fullscreen/borderless/F11 detection with countdown pause.\n"
+        L"• Automatic pause on Windows lock and resume after unlock.\n"
+        L"• Correct Windows suspend/resume handling.\n"
+        L"• Atomic settings writes to protect the INI file.\n"
+        L"• Extended tray status, countdown and fullscreen toggle.\n"
+        L"• WORK / PRESENTATION / GAMING operating profiles.\n"
+        L"• Active profile is saved and can also be changed from the tray menu.\n"
         L"• Test cursor movement without waiting for the interval.\n"
         L"• START / STOP without exiting the application.\n"
         L"• Minimize to system tray.\n"
@@ -1876,8 +2207,47 @@ int ReadNumber(
 void SaveSettings(
     bool running)
 {
-    std::wstring path =
-        GetSettingsPath();
+    std::wstring path = GetSettingsPath();
+    std::wstring tempPath = path + L".tmp";
+
+    // Write a complete new INI first. The live file is replaced only after
+    // every value has been written successfully.
+    DeleteFileW(tempPath.c_str());
+    std::wstring writePath = tempPath;
+
+    // Preserve all saved profile sections in the new atomic INI.
+    // Otherwise rebuilding settings.ini would keep only the active profile.
+    auto copyProfileSection = [&](int profile)
+    {
+        const std::wstring section = L"Profile." + GetProfileName(profile);
+        const wchar_t* keys[] = {
+            L"StartTime", L"EndTime", L"Interval", L"Pixels",
+            L"AutoStart", L"Tray",
+            L"PreventSleep", L"KeepDisplay", L"PauseFullscreen", L"Logging",
+            L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat", L"Sun"
+        };
+
+        for (const wchar_t* key : keys)
+        {
+            wchar_t value[128]{};
+            DWORD n = GetPrivateProfileStringW(
+                section.c_str(), key, L"",
+                value, 128, path.c_str()
+            );
+
+            if (n > 0)
+            {
+                WritePrivateProfileStringW(
+                    section.c_str(), key, value,
+                    writePath.c_str()
+                );
+            }
+        }
+    };
+
+    copyProfileSection(0);
+    copyProfileSection(1);
+    copyProfileSection(2);
 
     WritePrivateProfileStringW(
         L"MouseMover",
@@ -1885,7 +2255,7 @@ void SaveSettings(
         GetControlText(
             g_startTime
         ).c_str(),
-        path.c_str()
+        writePath.c_str()
     );
 
     WritePrivateProfileStringW(
@@ -1894,7 +2264,7 @@ void SaveSettings(
         GetControlText(
             g_endTime
         ).c_str(),
-        path.c_str()
+        writePath.c_str()
     );
 
     WritePrivateProfileStringW(
@@ -1903,7 +2273,7 @@ void SaveSettings(
         GetControlText(
             g_interval
         ).c_str(),
-        path.c_str()
+        writePath.c_str()
     );
 
     WritePrivateProfileStringW(
@@ -1912,7 +2282,7 @@ void SaveSettings(
         GetControlText(
             g_pixels
         ).c_str(),
-        path.c_str()
+        writePath.c_str()
     );
 
     WritePrivateProfileStringW(
@@ -1924,7 +2294,7 @@ void SaveSettings(
         ) == BST_CHECKED
             ? L"1"
             : L"0",
-        path.c_str()
+        writePath.c_str()
     );
 
     WritePrivateProfileStringW(
@@ -1936,28 +2306,28 @@ void SaveSettings(
         ) == BST_CHECKED
             ? L"1"
             : L"0",
-        path.c_str()
+        writePath.c_str()
     );
 
     WritePrivateProfileStringW(
         L"MouseMover",
         L"Language",
         g_english ? L"en" : L"cs",
-        path.c_str()
+        writePath.c_str()
     );
 
     WritePrivateProfileStringW(
         L"MouseMover",
         L"Running",
         running ? L"1" : L"0",
-        path.c_str()
+        writePath.c_str()
     );
 
     auto saveBool = [&](const wchar_t* key, int id)
     {
         WritePrivateProfileStringW(L"MouseMover", key,
             IsDlgButtonChecked(g_hwnd,id)==BST_CHECKED ? L"1" : L"0",
-            path.c_str());
+            writePath.c_str());
     };
     saveBool(L"PreventSleep", IDC_PREVENT_SLEEP);
     saveBool(L"KeepDisplay", IDC_KEEP_DISPLAY);
@@ -1969,17 +2339,83 @@ void SaveSettings(
         if (g_dayChecks[i])
             WritePrivateProfileStringW(L"MouseMover",dayKeys[i],
                 SendMessageW(g_dayChecks[i],BM_GETCHECK,0,0)==BST_CHECKED ? L"1":L"0",
-                path.c_str());
+                writePath.c_str());
 
-    // Force cached profile writes to be flushed to disk immediately.
-    // This makes the settings more robust if Windows/logoff shuts the
-    // process down shortly after a change.
+    // Persist ALL settings belonging to the active profile into the same
+    // temporary INI that atomically replaces the live settings file.
+    {
+        const std::wstring profileSection =
+            L"Profile." + GetProfileName(g_activeProfile);
+
+        auto profileText = [&](const wchar_t* key, HWND control)
+        {
+            WritePrivateProfileStringW(
+                profileSection.c_str(), key,
+                GetControlText(control).c_str(), writePath.c_str());
+        };
+
+        auto profileBool = [&](const wchar_t* key, int id)
+        {
+            WritePrivateProfileStringW(
+                profileSection.c_str(), key,
+                IsDlgButtonChecked(g_hwnd, id) == BST_CHECKED ? L"1" : L"0",
+                writePath.c_str());
+        };
+
+        profileText(L"StartTime", g_startTime);
+        profileText(L"EndTime", g_endTime);
+        profileText(L"Interval", g_interval);
+        profileText(L"Pixels", g_pixels);
+
+        profileBool(L"AutoStart", IDC_AUTOSTART);
+        profileBool(L"Tray", IDC_TRAYOPTION);
+        profileBool(L"PreventSleep", IDC_PREVENT_SLEEP);
+        profileBool(L"KeepDisplay", IDC_KEEP_DISPLAY);
+        profileBool(L"PauseFullscreen", IDC_PAUSE_FULLSCREEN);
+        profileBool(L"Logging", IDC_LOGGING);
+
+        const wchar_t* profileDayKeys[7] =
+            {L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat", L"Sun"};
+
+        for (int i = 0; i < 7; ++i)
+        {
+            if (g_dayChecks[i])
+            {
+                WritePrivateProfileStringW(
+                    profileSection.c_str(), profileDayKeys[i],
+                    SendMessageW(g_dayChecks[i], BM_GETCHECK, 0, 0) == BST_CHECKED
+                        ? L"1" : L"0",
+                    writePath.c_str());
+            }
+        }
+    }
+
     WritePrivateProfileStringW(
-        nullptr,
-        nullptr,
-        nullptr,
-        path.c_str()
+        L"MouseMover", L"Profile",
+        std::to_wstring(g_activeProfile).c_str(),
+        writePath.c_str()
     );
+
+    WritePrivateProfileStringW(
+        L"MouseMover", L"Theme",
+        g_matrixTheme ? L"Matrix" : L"Classic",
+        writePath.c_str()
+    );
+
+    // Flush the temporary INI before atomically replacing the live file.
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, writePath.c_str());
+
+    if (!MoveFileExW(
+            writePath.c_str(),
+            path.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        WriteLog(T(
+            L"VAROVÁNÍ: atomické uložení nastavení selhalo",
+            L"WARNING: atomic settings save failed"
+        ));
+        DeleteFileW(writePath.c_str());
+    }
 }
 
 
@@ -2228,6 +2664,22 @@ void WorkerThread()
 
     while (g_running)
     {
+        if (g_sessionLocked || g_powerSuspended)
+        {
+            PostStatus(T(
+                g_sessionLocked ? L"WINDOWS ZAMKNUT - pozastaveno" : L"NAPÁJENÍ - pozastaveno",
+                g_sessionLocked ? L"WINDOWS LOCKED - paused" : L"POWER - paused"
+            ));
+            PostCountdown(remaining);
+            g_remainingSeconds.store(remaining);
+
+            std::unique_lock<std::mutex> lock(g_mutex);
+            if (g_cv.wait_for(lock, std::chrono::milliseconds(250),
+                              [](){ return !g_running.load(); }))
+                break;
+            continue;
+        }
+
         const bool pauseOnFullscreen =
             IsDlgButtonChecked(g_hwnd, IDC_PAUSE_FULLSCREEN) == BST_CHECKED;
 
@@ -2240,6 +2692,7 @@ void WorkerThread()
 
             // Freeze countdown and suppress automatic cursor movement.
             PostCountdown(remaining);
+            g_remainingSeconds.store(remaining);
 
             if (!fullscreenPauseLogged)
             {
@@ -2247,6 +2700,7 @@ void WorkerThread()
                     L"Fullscreen detekován - automatický pohyb pozastaven",
                     L"Fullscreen detected - automatic movement paused"
                 ));
+                WriteLog(L"Fullscreen details: " + GetForegroundWindowDiagnostic());
                 fullscreenPauseLogged = true;
             }
 
@@ -2422,6 +2876,8 @@ void WorkerThread()
             PostCountdown(
                 remaining
             );
+            g_remainingSeconds.store(remaining);
+            UpdateTrayTooltip();
         }
 
 
@@ -2473,9 +2929,11 @@ void WorkerThread()
     }
 
 
+    g_remainingSeconds.store(-1);
     PostCountdown(
         -1
     );
+    UpdateTrayTooltip();
 
     PostStatus(
         (g_matrixTheme ? L"> SYSTEM STOPPED <" : T(L"VYPNUTO", L"STOPPED"))
@@ -2918,6 +3376,15 @@ void ShowTrayMenu()
         return;
 
 
+    std::wstring trayState = g_running
+        ? T(L"Stav: AKTIVNÍ", L"Status: ACTIVE")
+        : T(L"Stav: VYPNUTO", L"Status: STOPPED");
+    if (g_running && g_remainingSeconds.load() >= 0)
+        trayState += L" • " + FormatMMSS(g_remainingSeconds.load());
+
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, trayState.c_str());
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
     AppendMenuW(
         menu,
         MF_STRING,
@@ -2946,7 +3413,22 @@ void ShowTrayMenu()
     );
 
 
+    HMENU profileMenu = CreatePopupMenu();
+    AppendMenuW(profileMenu, MF_STRING | (g_activeProfile == 0 ? MF_CHECKED : 0), ID_TRAY_PROFILE_WORK, GetProfileDisplayName(0).c_str());
+    AppendMenuW(profileMenu, MF_STRING | (g_activeProfile == 1 ? MF_CHECKED : 0), ID_TRAY_PROFILE_PRESENTATION, GetProfileDisplayName(1).c_str());
+    AppendMenuW(profileMenu, MF_STRING | (g_activeProfile == 2 ? MF_CHECKED : 0), ID_TRAY_PROFILE_GAMING, GetProfileDisplayName(2).c_str());
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(profileMenu), T(L"Profil", L"Profile"));
+
     AppendMenuW(menu, MF_STRING, ID_TRAY_TEST, T(L"Test pohybu", L"Test movement"));
+
+    UINT fsFlags = MF_STRING;
+    if (IsChecked(IDC_PAUSE_FULLSCREEN))
+        fsFlags |= MF_CHECKED;
+    AppendMenuW(
+        menu, fsFlags, ID_TRAY_PAUSE_FULLSCREEN,
+        T(L"Pozastavit ve fullscreen", L"Pause on fullscreen")
+    );
+
     AppendMenuW(menu, MF_STRING, ID_TRAY_OPEN_LOG, T(L"Otevřít log", L"Open log"));
     AppendMenuW(menu, MF_STRING, ID_TRAY_ABOUT, T(L"O programu", L"About"));
 
@@ -3142,6 +3624,8 @@ LRESULT CALLBACK WindowProc(
 
         case WM_CREATE:
         {
+            WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+
             // The animated Matrix background must never paint over child controls.
             // Without WS_CLIPCHILDREN Windows can repeatedly repaint controls while
             // the parent animation is updating, which looks like whole-GUI flicker.
@@ -3500,19 +3984,19 @@ LRESULT CALLBACK WindowProc(
 
             g_preventSleepUi = CreateWindowW(L"BUTTON",
                 T(L"Zabránit uspání PC", L"Prevent PC sleep"),
-                WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 40,448,200,24,
+                WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 40,448,225,24,
                 hwnd,reinterpret_cast<HMENU>(IDC_PREVENT_SLEEP),nullptr,nullptr);
             g_keepDisplayUi = CreateWindowW(L"BUTTON",
                 T(L"Nechat displej zapnutý", L"Keep display on"),
-                WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 265,448,200,24,
+                WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 265,448,230,24,
                 hwnd,reinterpret_cast<HMENU>(IDC_KEEP_DISPLAY),nullptr,nullptr);
             g_pauseFullscreenUi = CreateWindowW(L"BUTTON",
                 T(L"Pozastavit ve fullscreen", L"Pause on fullscreen"),
-                WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 40,478,200,24,
+                WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 40,478,225,24,
                 hwnd,reinterpret_cast<HMENU>(IDC_PAUSE_FULLSCREEN),nullptr,nullptr);
             g_loggingUi = CreateWindowW(L"BUTTON",
                 T(L"Diagnostický log", L"Diagnostic log"),
-                WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 265,478,200,24,
+                WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 265,478,230,24,
                 hwnd,reinterpret_cast<HMENU>(IDC_LOGGING),nullptr,nullptr);
 
             const wchar_t* daysCs[7]={L"Po",L"Út",L"St",L"Čt",L"Pá",L"So",L"Ne"};
@@ -3665,6 +4149,8 @@ HWND startButton =
                      g_autoStart,
                      g_trayOption,
                      g_languageButton,
+                     g_profileLabelUi,
+                     g_profileUi,
                      startButton,
                      stopButton,
                      g_status,
@@ -3751,10 +4237,33 @@ HWND startButton =
             CheckDlgButton(hwnd,IDC_KEEP_DISPLAY,ReadBoolSetting(L"KeepDisplay",true)?BST_CHECKED:BST_UNCHECKED);
             CheckDlgButton(hwnd,IDC_PAUSE_FULLSCREEN,ReadBoolSetting(L"PauseFullscreen",false)?BST_CHECKED:BST_UNCHECKED);
             CheckDlgButton(hwnd,IDC_LOGGING,ReadBoolSetting(L"Logging",false)?BST_CHECKED:BST_UNCHECKED);
+            {
+                wchar_t profileBuf[16]{};
+                GetPrivateProfileStringW(L"MouseMover", L"Profile", L"0",
+                    profileBuf, 16, GetSettingsPath().c_str());
+                g_activeProfile = _wtoi(profileBuf);
+                if (g_activeProfile < 0 || g_activeProfile > 2) g_activeProfile = 0;
+                UpdateProfileUi();
+            }
             const wchar_t* dayKeysLoad[7]={L"Mon",L"Tue",L"Wed",L"Thu",L"Fri",L"Sat",L"Sun"};
             for(int i=0;i<7;++i)
                 if(g_dayChecks[i]) SendMessageW(g_dayChecks[i],BM_SETCHECK,
                     ReadBoolSetting(dayKeysLoad[i],true)?BST_CHECKED:BST_UNCHECKED,0);
+            g_profileLabelUi = CreateWindowW(
+                L"STATIC", T(L"Profil:", L"Profile:"),
+                WS_CHILD | WS_VISIBLE,
+                205, 75, 75, 24, hwnd, nullptr, nullptr, nullptr);
+
+            g_profileUi = CreateWindowW(
+                L"COMBOBOX", L"",
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+                285, 72, 180, 180, hwnd,
+                reinterpret_cast<HMENU>(IDC_PROFILE), nullptr, nullptr);
+
+
+            UpdateProfileUi();
+            LoadProfileSettings(g_activeProfile);
+
             g_themeUi = CreateWindowW(
                 L"BUTTON",
                 L"",
@@ -4158,6 +4667,30 @@ HWND startButton =
                     break;
                 }
 
+                case ID_TRAY_PROFILE_WORK:
+                    ApplyProfile(0, true);
+                    break;
+                case ID_TRAY_PROFILE_PRESENTATION:
+                    ApplyProfile(1, true);
+                    break;
+                case ID_TRAY_PROFILE_GAMING:
+                    ApplyProfile(2, true);
+                    break;
+
+                case ID_TRAY_PAUSE_FULLSCREEN:
+                {
+                    bool enabled = !IsChecked(IDC_PAUSE_FULLSCREEN);
+                    CheckDlgButton(
+                        g_hwnd, IDC_PAUSE_FULLSCREEN,
+                        enabled ? BST_CHECKED : BST_UNCHECKED
+                    );
+                    SaveSettings(g_running);
+                    WriteLog(enabled
+                        ? T(L"Pause on fullscreen zapnuto", L"Pause on fullscreen enabled")
+                        : T(L"Pause on fullscreen vypnuto", L"Pause on fullscreen disabled"));
+                    break;
+                }
+
                 case ID_TRAY_TEST:
                 {
                     PerformTestMovement();
@@ -4178,6 +4711,26 @@ HWND startButton =
                 {
                     SaveSettings(g_running);
                     if (g_running) SetKeepAwake(true);
+                    break;
+                }
+
+                case IDC_PROFILE:
+                {
+                    if (HIWORD(wParam) == CBN_SELCHANGE)
+                    {
+                        int selected = static_cast<int>(SendMessageW(g_profileUi, CB_GETCURSEL, 0, 0));
+                        if (selected != CB_ERR)
+                        {
+                            ApplyProfile(selected, true);
+
+                            // Remove focus from the ComboBox after selection.
+                            // This prevents the selected profile text from
+                            // remaining blue-highlighted.
+                            SetFocus(hwnd);
+                            InvalidateRect(g_profileUi, nullptr, TRUE);
+                            UpdateWindow(g_profileUi);
+                        }
+                    }
                     break;
                 }
 
@@ -4395,6 +4948,49 @@ HWND startButton =
         // Also used to refresh tray icon.
         // ----------------------------------------------------
 
+        case WM_WTSSESSION_CHANGE:
+        {
+            if (wParam == WTS_SESSION_LOCK)
+            {
+                g_sessionLocked.store(true);
+                WriteLog(T(L"Windows session zamknuta - Mouse Mover pozastaven",
+                           L"Windows session locked - Mouse Mover paused"));
+                UpdateTrayTooltip();
+                g_cv.notify_all();
+            }
+            else if (wParam == WTS_SESSION_UNLOCK)
+            {
+                g_sessionLocked.store(false);
+                WriteLog(T(L"Windows session odemknuta - Mouse Mover obnoven",
+                           L"Windows session unlocked - Mouse Mover resumed"));
+                if (g_running) SetKeepAwake(true);
+                UpdateTrayTooltip();
+                g_cv.notify_all();
+            }
+            return 0;
+        }
+
+        case WM_POWERBROADCAST:
+        {
+            if (wParam == PBT_APMSUSPEND)
+            {
+                g_powerSuspended.store(true);
+                WriteLog(T(L"Windows přechází do režimu spánku",
+                           L"Windows is suspending"));
+            }
+            else if (wParam == PBT_APMRESUMEAUTOMATIC ||
+                     wParam == PBT_APMRESUMESUSPEND)
+            {
+                g_powerSuspended.store(false);
+                WriteLog(T(L"Windows obnoven - přepočítávám stav",
+                           L"Windows resumed - recalculating state"));
+                if (g_running) SetKeepAwake(true);
+                g_remainingSeconds.store(ReadNumber(g_interval,30,1,86400));
+                g_cv.notify_all();
+            }
+            return TRUE;
+        }
+
         case WM_SETTINGCHANGE:
         {
             RefreshTrayIcon();
@@ -4408,6 +5004,7 @@ HWND startButton =
 
         case WM_DESTROY:
         {
+            WTSUnRegisterSessionNotification(hwnd);
             DestroyDynamicTrayIcons();
             if (g_themeWindowBrush)
             {
@@ -4451,6 +5048,7 @@ HWND startButton =
             if (g_fontClassicTitle) { DeleteObject(g_fontClassicTitle); g_fontClassicTitle = nullptr; }
             if (g_fontMatrix) { DeleteObject(g_fontMatrix); g_fontMatrix = nullptr; }
             if (g_fontMatrixTitle) { DeleteObject(g_fontMatrixTitle); g_fontMatrixTitle = nullptr; }
+            if (g_fontMatrixOptions) { DeleteObject(g_fontMatrixOptions); g_fontMatrixOptions = nullptr; }
 
 
             PostQuitMessage(
