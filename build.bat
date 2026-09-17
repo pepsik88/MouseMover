@@ -36,7 +36,7 @@ g++ -std=c++17 -O2 -mwindows ^
   src\MouseMover.cpp ^
   build\MouseMover_res.o ^
   -o MouseMover.exe ^
-  -lshell32 || exit /b 1
+  -lshell32 -lwtsapi32 || exit /b 1
 
 echo.
 echo BUILD SUCCESSFUL: MouseMover.exe
