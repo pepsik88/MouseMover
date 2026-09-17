@@ -1219,22 +1219,61 @@ void WriteLog(const std::wstring& message)
 bool IsFullscreenForeground()
 {
     HWND fg = GetForegroundWindow();
-    if (!fg || fg == g_hwnd)
+
+    if (!fg || fg == g_hwnd || !IsWindowVisible(fg) || IsIconic(fg))
         return false;
 
-    RECT wr{};
-    if (!GetWindowRect(fg, &wr))
-        return false;
+    QUERY_USER_NOTIFICATION_STATE quns = QUNS_ACCEPTS_NOTIFICATIONS;
+    if (SUCCEEDED(SHQueryUserNotificationState(&quns)))
+    {
+        if (quns == QUNS_RUNNING_D3D_FULL_SCREEN ||
+            quns == QUNS_PRESENTATION_MODE)
+            return true;
+    }
 
     HMONITOR mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi{sizeof(mi)};
     if (!GetMonitorInfoW(mon, &mi))
         return false;
 
-    return wr.left <= mi.rcMonitor.left &&
-           wr.top <= mi.rcMonitor.top &&
-           wr.right >= mi.rcMonitor.right &&
-           wr.bottom >= mi.rcMonitor.bottom;
+    RECT wr{};
+    if (!GetWindowRect(fg, &wr))
+        return false;
+
+    constexpr int tolerance = 3;
+
+    const bool coversMonitor =
+        wr.left   <= mi.rcMonitor.left   + tolerance &&
+        wr.top    <= mi.rcMonitor.top    + tolerance &&
+        wr.right  >= mi.rcMonitor.right  - tolerance &&
+        wr.bottom >= mi.rcMonitor.bottom - tolerance;
+
+    if (!coversMonitor)
+        return false;
+
+    LONG_PTR style = GetWindowLongPtrW(fg, GWL_STYLE);
+    const bool borderless =
+        (style & WS_CAPTION) == 0 ||
+        (style & WS_POPUP) != 0;
+
+    if (borderless)
+        return true;
+
+    RECT cr{};
+    if (!GetClientRect(fg, &cr))
+        return false;
+
+    POINT tl{cr.left, cr.top};
+    POINT br{cr.right, cr.bottom};
+
+    if (!ClientToScreen(fg, &tl) || !ClientToScreen(fg, &br))
+        return false;
+
+    return
+        tl.x <= mi.rcMonitor.left   + tolerance &&
+        tl.y <= mi.rcMonitor.top    + tolerance &&
+        br.x >= mi.rcMonitor.right  - tolerance &&
+        br.y >= mi.rcMonitor.bottom - tolerance;
 }
 
 bool IsTodayEnabled()
@@ -1373,7 +1412,7 @@ void ShowAbout()
         L"• Plánování aktivního času programu.\n"
         L"• Výběr aktivních dnů Po–Ne.\n"
         L"• Podpora časového intervalu přes půlnoc.\n"
-        L"• Volitelné pozastavení automatického pohybu ve fullscreen aplikaci.\n"
+        L"• Volitelné pozastavení automatického pohybu a odpočtu ve fullscreen aplikaci.\n"
         L"• Testovací pohyb kurzoru bez čekání na interval.\n"
         L"• START / STOP bez ukončení programu.\n"
         L"• Minimalizace do system tray.\n"
@@ -1415,7 +1454,7 @@ void ShowAbout()
         L"• Configurable active time schedule.\n"
         L"• Selectable active days Monday–Sunday.\n"
         L"• Active time ranges across midnight are supported.\n"
-        L"• Optional automatic movement pause in fullscreen applications.\n"
+        L"• Optional automatic movement and countdown pause in fullscreen applications.\n"
         L"• Test cursor movement without waiting for the interval.\n"
         L"• START / STOP without exiting the application.\n"
         L"• Minimize to system tray.\n"
@@ -2185,8 +2224,59 @@ void WorkerThread()
         remaining
     );
 
+    bool fullscreenPauseLogged = false;
+
     while (g_running)
     {
+        const bool pauseOnFullscreen =
+            IsDlgButtonChecked(g_hwnd, IDC_PAUSE_FULLSCREEN) == BST_CHECKED;
+
+        if (pauseOnFullscreen && IsFullscreenForeground())
+        {
+            PostStatus(T(
+                L"FULLSCREEN - pozastaveno",
+                L"FULLSCREEN - paused"
+            ));
+
+            // Freeze countdown and suppress automatic cursor movement.
+            PostCountdown(remaining);
+
+            if (!fullscreenPauseLogged)
+            {
+                WriteLog(T(
+                    L"Fullscreen detekován - automatický pohyb pozastaven",
+                    L"Fullscreen detected - automatic movement paused"
+                ));
+                fullscreenPauseLogged = true;
+            }
+
+            std::unique_lock<std::mutex> lock(g_mutex);
+            const bool stopped = g_cv.wait_for(
+                lock,
+                std::chrono::milliseconds(250),
+                []() { return !g_running.load(); }
+            );
+
+            if (stopped)
+                break;
+
+            continue;
+        }
+
+        if (fullscreenPauseLogged)
+        {
+            WriteLog(T(
+                L"Fullscreen ukončen - automatický pohyb obnoven",
+                L"Fullscreen ended - automatic movement resumed"
+            ));
+            fullscreenPauseLogged = false;
+
+            PostStatus(
+                g_matrixTheme
+                    ? L"> SYSTEM ACTIVE <"
+                    : T(L"AKTIVNÍ", L"ACTIVE")
+            );
+        }
 
         UserActivityKind activity = DetectUserActivity();
 
