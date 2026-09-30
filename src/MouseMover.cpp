@@ -64,7 +64,8 @@ enum ControlId
     IDC_SUN,
     IDC_OPEN_LOG,
     IDC_THEME,
-    IDC_PROFILE
+    IDC_PROFILE,
+    IDC_ALWAYS_MOVE
 };
 
 // ============================================================
@@ -117,6 +118,7 @@ static HWND g_titleUi = nullptr;
 static HWND g_scheduleTitleUi = nullptr;
 static HWND g_movementTitleUi = nullptr;
 static HWND g_windowsTitleUi = nullptr;
+static HWND g_windowsIdleUi = nullptr;
 static HWND g_keepAwakeStatusUi = nullptr;
 static HWND g_lastActivityUi = nullptr;
 static HWND g_testButtonUi = nullptr;
@@ -124,6 +126,7 @@ static HWND g_preventSleepUi = nullptr;
 static HWND g_keepDisplayUi = nullptr;
 static HWND g_pauseFullscreenUi = nullptr;
 static HWND g_loggingUi = nullptr;
+static HWND g_alwaysMoveUi = nullptr;
 static HWND g_statsUi = nullptr;
 static HWND g_resetUi = nullptr;
 static HWND g_aboutUi = nullptr;
@@ -279,6 +282,7 @@ static ULONGLONG g_ignoreMouseUntilTick = 0;
 
 
 static std::atomic<bool> g_running(false);
+static bool g_keepAwakeRuntimeActive = false;
 
 static std::thread g_worker;
 
@@ -327,6 +331,52 @@ void SaveThemeSetting();
 void UpdateStats();
 void UpdateKeepAwakeIndicator();
 void UpdateLastActivityLabel();
+
+
+static ULONGLONG GetWindowsIdleMilliseconds()
+{
+    LASTINPUTINFO lii{};
+    lii.cbSize = sizeof(lii);
+
+    if (!GetLastInputInfo(&lii))
+        return 0;
+
+    return GetTickCount64() - static_cast<ULONGLONG>(lii.dwTime);
+}
+
+static void UpdateWindowsIdleStatus()
+{
+    if (!g_windowsIdleUi)
+        return;
+
+    const ULONGLONG idleMs = GetWindowsIdleMilliseconds();
+    const ULONGLONG totalSeconds = idleMs / 1000ULL;
+
+    const ULONGLONG hours = totalSeconds / 3600ULL;
+    const ULONGLONG minutes = (totalSeconds % 3600ULL) / 60ULL;
+    const ULONGLONG seconds = totalSeconds % 60ULL;
+
+    // "ACTIVE" means Windows has received real user input during the
+    // last 60 seconds. MouseMover's own status is intentionally separate.
+    const bool active = totalSeconds < 60ULL;
+
+    wchar_t buffer[160]{};
+
+    swprintf_s(
+        buffer,
+        g_english
+            ? L"Windows: %s   |   Idle: %02llu:%02llu:%02llu"
+            : L"Windows: %s   |   Nečinnost: %02llu:%02llu:%02llu",
+        active
+            ? (g_english ? L"ACTIVE" : L"AKTIVNÍ")
+            : L"IDLE",
+        hours,
+        minutes,
+        seconds
+    );
+
+    SetWindowTextW(g_windowsIdleUi, buffer);
+}
 
 void UpdateLanguage()
 {
@@ -391,6 +441,8 @@ void UpdateLanguage()
     if(g_keepDisplayUi) SetWindowTextW(g_keepDisplayUi,T(L"Nechat displej zapnutý",L"Keep display on"));
     if(g_pauseFullscreenUi) SetWindowTextW(g_pauseFullscreenUi,T(L"Pozastavit ve fullscreen",L"Pause on fullscreen"));
     if(g_loggingUi) SetWindowTextW(g_loggingUi,T(L"Diagnostický log",L"Diagnostic log"));
+    if(g_alwaysMoveUi) SetWindowTextW(g_alwaysMoveUi,
+        T(L"Stálý pohyb (ignorovat časový plán)", L"Always move (ignore schedule)"));
     if(g_aboutUi) SetWindowTextW(g_aboutUi,
         g_matrixTheme ? L"[ INFO ]" : T(L"O PROGRAMU",L"ABOUT"));
     if(g_openLogUi) SetWindowTextW(g_openLogUi,
@@ -411,6 +463,7 @@ void UpdateLanguage()
 
     UpdateKeepAwakeIndicator();
     UpdateLastActivityLabel();
+    // UpdateWindowsIdleStatus(); // Windows ACTIVE/IDLE display disabled
 
     if (g_status)
     {
@@ -1067,6 +1120,7 @@ void SaveCurrentProfileSettings()
     writeBool(L"KeepDisplay", IDC_KEEP_DISPLAY);
     writeBool(L"PauseFullscreen", IDC_PAUSE_FULLSCREEN);
     writeBool(L"Logging", IDC_LOGGING);
+    writeBool(L"AlwaysMove", IDC_ALWAYS_MOVE);
 
     const wchar_t* dayKeys[7] =
         {L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat", L"Sun"};
@@ -1144,6 +1198,7 @@ void LoadProfileSettings(int profile)
     loadBool(L"KeepDisplay", IDC_KEEP_DISPLAY, globalBool(L"KeepDisplay", true));
     loadBool(L"PauseFullscreen", IDC_PAUSE_FULLSCREEN, globalBool(L"PauseFullscreen", false));
     loadBool(L"Logging", IDC_LOGGING, globalBool(L"Logging", false));
+    loadBool(L"AlwaysMove", IDC_ALWAYS_MOVE, globalBool(L"AlwaysMove", false));
 
     const wchar_t* dayKeys[7] =
         {L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat", L"Sun"};
@@ -1303,7 +1358,8 @@ void ApplyTheme()
         g_preventSleepUi,
         g_keepDisplayUi,
         g_pauseFullscreenUi,
-        g_loggingUi
+        g_loggingUi,
+        g_alwaysMoveUi
     };
     for (HWND control : optionControls)
     {
@@ -1312,6 +1368,9 @@ void ApplyTheme()
                 reinterpret_cast<WPARAM>(optionFont), TRUE);
     }
 
+    // Author footer disabled in the main window.
+    // The author information remains available in O PROGRAMU / ABOUT.
+    /*
     if (g_footerUi)
     {
         ShowWindow(g_footerUi, SW_SHOW);
@@ -1322,6 +1381,9 @@ void ApplyTheme()
                 : L"Created by Tomáš Němec"
         );
     }
+    */
+    if (g_footerUi)
+        ShowWindow(g_footerUi, SW_HIDE);
 
     if (g_themeUi)
         SetWindowTextW(
@@ -1777,6 +1839,7 @@ void ShowAbout()
         L"• Windows system sleep prevention.\n"
         L"• Optional keep-display-on mode.\n"
         L"• Configurable active time schedule.\n"
+            L"• Always Move mode can bypass the configured schedule.\n"
         L"• Selectable active days Monday–Sunday.\n"
         L"• Active time ranges across midnight are supported.\n"
         L"• Improved fullscreen/borderless/F11 detection with countdown pause.\n"
@@ -1958,6 +2021,22 @@ LRESULT CALLBACK LowLevelKeyboardProc(
         (wParam == WM_KEYDOWN ||
          wParam == WM_SYSKEYDOWN))
     {
+        const KBDLLHOOKSTRUCT* keyInfo =
+            reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+
+        // Ignore keyboard input generated by MouseMover itself (SendInput).
+        // Otherwise the synthetic Ctrl press before an automatic mouse move
+        // would be detected as real user typing and reset the countdown.
+        if (keyInfo && (keyInfo->flags & LLKHF_INJECTED))
+        {
+            return CallNextHookEx(
+                g_keyboardHook,
+                nCode,
+                wParam,
+                lParam
+            );
+        }
+
         g_keyboardActivityPending.store(
             true,
             std::memory_order_relaxed
@@ -2223,7 +2302,7 @@ void SaveSettings(
         const wchar_t* keys[] = {
             L"StartTime", L"EndTime", L"Interval", L"Pixels",
             L"AutoStart", L"Tray",
-            L"PreventSleep", L"KeepDisplay", L"PauseFullscreen", L"Logging",
+            L"PreventSleep", L"KeepDisplay", L"PauseFullscreen", L"Logging", L"AlwaysMove",
             L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat", L"Sun"
         };
 
@@ -2333,6 +2412,7 @@ void SaveSettings(
     saveBool(L"KeepDisplay", IDC_KEEP_DISPLAY);
     saveBool(L"PauseFullscreen", IDC_PAUSE_FULLSCREEN);
     saveBool(L"Logging", IDC_LOGGING);
+    saveBool(L"AlwaysMove", IDC_ALWAYS_MOVE);
 
     const wchar_t* dayKeys[7] = {L"Mon",L"Tue",L"Wed",L"Thu",L"Fri",L"Sat",L"Sun"};
     for (int i=0;i<7;++i)
@@ -2373,6 +2453,7 @@ void SaveSettings(
         profileBool(L"KeepDisplay", IDC_KEEP_DISPLAY);
         profileBool(L"PauseFullscreen", IDC_PAUSE_FULLSCREEN);
         profileBool(L"Logging", IDC_LOGGING);
+        profileBool(L"AlwaysMove", IDC_ALWAYS_MOVE);
 
         const wchar_t* profileDayKeys[7] =
             {L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat", L"Sun"};
@@ -2554,8 +2635,28 @@ void PostCountdown(
 // Move cursor
 // ============================================================
 
+static void PressCtrlBeforeAutomaticMove()
+{
+    INPUT inputs[2]{};
+
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_CONTROL;
+
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = VK_CONTROL;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    SendInput(2, inputs, sizeof(INPUT));
+
+    // Give Windows a brief moment to process Ctrl before moving the cursor.
+    Sleep(30);
+}
+
 void MoveCursor()
 {
+    // Press and release Ctrl immediately before every automatic movement.
+    PressCtrlBeforeAutomaticMove();
+
     POINT originalPosition{};
 
     if (!GetCursorPos(&originalPosition))
@@ -2640,6 +2741,29 @@ void MoveCursor()
 // Worker thread
 // ============================================================
 
+
+static void SetRuntimeKeepAwake(bool active)
+{
+    if (g_keepAwakeRuntimeActive == active)
+        return;
+
+    g_keepAwakeRuntimeActive = active;
+
+    if (!active)
+    {
+        SetThreadExecutionState(ES_CONTINUOUS);
+        return;
+    }
+
+    EXECUTION_STATE state =
+        static_cast<EXECUTION_STATE>(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+
+    if (IsDlgButtonChecked(g_hwnd, IDC_KEEP_DISPLAY) == BST_CHECKED)
+        state = static_cast<EXECUTION_STATE>(state | ES_DISPLAY_REQUIRED);
+
+    SetThreadExecutionState(state);
+}
+
 void WorkerThread()
 {
     POINT lastPosition{};
@@ -2664,6 +2788,15 @@ void WorkerThread()
 
     while (g_running)
     {
+        const bool runtimeAlwaysMove =
+            IsDlgButtonChecked(g_hwnd, IDC_ALWAYS_MOVE) == BST_CHECKED;
+        const bool runtimeScheduleActive =
+            runtimeAlwaysMove || IsActiveTime();
+
+        // Hold the Windows keep-awake request only while MouseMover is running
+        // and its movement schedule is active.
+        SetRuntimeKeepAwake(g_running && runtimeScheduleActive);
+
         if (g_sessionLocked || g_powerSuspended)
         {
             PostStatus(T(
@@ -2781,7 +2914,10 @@ void WorkerThread()
         // Outside configured time
         // ----------------------------------------------------
 
-        if (!IsActiveTime())
+        const bool alwaysMove =
+            IsDlgButtonChecked(g_hwnd, IDC_ALWAYS_MOVE) == BST_CHECKED;
+
+        if (!alwaysMove && !IsActiveTime())
         {
             PostStatus(
                 T(L"MIMO ČAS - čekám", L"OUTSIDE HOURS - waiting")
@@ -2911,7 +3047,14 @@ void WorkerThread()
         // Update countdown
         // ----------------------------------------------------
 
-        if (IsActiveTime())
+        // Always Move must also bypass the schedule here.
+        // Previously the main movement block ignored the schedule correctly,
+        // but this countdown block reset 'remaining' every second whenever
+        // the current time was outside the configured interval.
+        const bool alwaysMoveCountdown =
+            IsDlgButtonChecked(g_hwnd, IDC_ALWAYS_MOVE) == BST_CHECKED;
+
+        if (alwaysMoveCountdown || IsActiveTime())
         {
             if (remaining > 0)
                 --remaining;
@@ -2938,6 +3081,7 @@ void WorkerThread()
     PostStatus(
         (g_matrixTheme ? L"> SYSTEM STOPPED <" : T(L"VYPNUTO", L"STOPPED"))
     );
+    SetRuntimeKeepAwake(false);
 }
 
 
@@ -3276,6 +3420,7 @@ void StartApplication()
 void StopApplication(
     bool saveSettings = true)
 {
+    SetRuntimeKeepAwake(false);
     g_running =
         false;
 
@@ -3811,6 +3956,15 @@ LRESULT CALLBACK WindowProc(
                 );
 
 
+            // Ignore schedule / always move belongs to the PLAN section.
+            // It is placed directly below Start/Stop time fields.
+            g_alwaysMoveUi = CreateWindowW(L"BUTTON",
+                T(L"Stálý pohyb (ignorovat časový plán)",
+                  L"Always move (ignore schedule)"),
+                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                40, 180, 425, 20,
+                hwnd, reinterpret_cast<HMENU>(IDC_ALWAYS_MOVE), nullptr, nullptr);
+
             g_movementTitleUi =
                 CreateWindowW(
                     L"STATIC",
@@ -3982,39 +4136,58 @@ LRESULT CALLBACK WindowProc(
 
             
 
+            // ------------------------------------------------
+            // Windows real input / idle status - DISABLED
+            // ------------------------------------------------
+            /*
+            g_windowsIdleUi = CreateWindowW(
+                L"STATIC",
+                L"",
+                WS_CHILD | WS_VISIBLE,
+                40, 442, 425, 24,
+                hwnd,
+                nullptr,
+                nullptr,
+                nullptr
+            );
+
+            UpdateWindowsIdleStatus();
+            */
+
+
             g_preventSleepUi = CreateWindowW(L"BUTTON",
                 T(L"Zabránit uspání PC", L"Prevent PC sleep"),
-                WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 40,448,225,24,
+                WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 40,472,225,24,
                 hwnd,reinterpret_cast<HMENU>(IDC_PREVENT_SLEEP),nullptr,nullptr);
             g_keepDisplayUi = CreateWindowW(L"BUTTON",
                 T(L"Nechat displej zapnutý", L"Keep display on"),
-                WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 265,448,230,24,
+                WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 265,472,230,24,
                 hwnd,reinterpret_cast<HMENU>(IDC_KEEP_DISPLAY),nullptr,nullptr);
             g_pauseFullscreenUi = CreateWindowW(L"BUTTON",
                 T(L"Pozastavit ve fullscreen", L"Pause on fullscreen"),
-                WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 40,478,225,24,
+                WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 40,502,225,24,
                 hwnd,reinterpret_cast<HMENU>(IDC_PAUSE_FULLSCREEN),nullptr,nullptr);
             g_loggingUi = CreateWindowW(L"BUTTON",
                 T(L"Diagnostický log", L"Diagnostic log"),
-                WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 265,478,230,24,
+                WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 265,502,230,24,
                 hwnd,reinterpret_cast<HMENU>(IDC_LOGGING),nullptr,nullptr);
 
             const wchar_t* daysCs[7]={L"Po",L"Út",L"St",L"Čt",L"Pá",L"So",L"Ne"};
             const wchar_t* daysEn[7]={L"Mo",L"Tu",L"We",L"Th",L"Fr",L"Sa",L"Su"};
             for(int i=0;i<7;++i)
                 g_dayChecks[i]=CreateWindowW(L"BUTTON",g_english?daysEn[i]:daysCs[i],
-                    WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,40+i*61,512,55,24,
+                    WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,40+i*61,542,55,24,
                     hwnd,reinterpret_cast<HMENU>(IDC_MON+i),nullptr,nullptr);
 
             g_statsUi=CreateWindowW(L"STATIC",L"",WS_CHILD|WS_VISIBLE,
-                40,544,425,24,hwnd,reinterpret_cast<HMENU>(IDC_STATS),nullptr,nullptr);
+                40,574,425,24,hwnd,reinterpret_cast<HMENU>(IDC_STATS),nullptr,nullptr);
 
             g_lastActivityUi =
                 CreateWindowW(
                     L"STATIC",
                     L"",
                     WS_CHILD | WS_VISIBLE,
-                    40, 576, 425, 28,
+                    40, 606, 425, 28,
                     hwnd,
                     reinterpret_cast<HMENU>(IDC_LAST_ACTIVITY),
                     nullptr,
@@ -4026,7 +4199,7 @@ LRESULT CALLBACK WindowProc(
                     L"BUTTON",
                     L"TEST",
                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    40, 610, 135, 36,
+                    40, 640, 135, 36,
                     hwnd,
                     reinterpret_cast<HMENU>(IDC_TEST),
                     nullptr,
@@ -4042,7 +4215,7 @@ HWND startButton =
                     WS_VISIBLE |
                     BS_OWNERDRAW,
                     40,
-                    662,
+                    688,
                     195,
                     44,
                     hwnd,
@@ -4062,7 +4235,7 @@ HWND startButton =
                     WS_VISIBLE |
                     WS_DISABLED,
                     270,
-                    662,
+                    688,
                     195,
                     44,
                     hwnd,
@@ -4075,13 +4248,13 @@ HWND startButton =
 
 
             g_openLogUi=CreateWindowW(L"BUTTON",T(L"[ LOG ]",L"[ LOG ]"),
-                WS_CHILD|WS_VISIBLE,185,610,105,36,hwnd,
+                WS_CHILD|WS_VISIBLE,185,640,105,36,hwnd,
                 reinterpret_cast<HMENU>(IDC_OPEN_LOG),nullptr,nullptr);
             g_resetUi=CreateWindowW(L"BUTTON",L"RESET",
-                WS_CHILD|WS_VISIBLE,300,610,75,36,hwnd,
+                WS_CHILD|WS_VISIBLE,300,640,75,36,hwnd,
                 reinterpret_cast<HMENU>(IDC_RESET),nullptr,nullptr);
             g_aboutUi=CreateWindowW(L"BUTTON",T(L"[ INFO ]",L"[ INFO ]"),
-                WS_CHILD|WS_VISIBLE,385,610,110,36,hwnd,
+                WS_CHILD|WS_VISIBLE,385,640,110,36,hwnd,
                 reinterpret_cast<HMENU>(IDC_ABOUT),nullptr,nullptr);
 
             g_startButtonUi = startButton;
@@ -4100,7 +4273,7 @@ HWND startButton =
                     WS_VISIBLE |
                     SS_CENTER,
                     40,
-                    722,
+                    744,
                     425,
                     38,
                     hwnd,
@@ -4124,7 +4297,7 @@ HWND startButton =
                     WS_VISIBLE |
                     SS_CENTER,
                     40,
-                    768,
+                    790,
                     425,
                     38,
                     hwnd,
@@ -4237,6 +4410,7 @@ HWND startButton =
             CheckDlgButton(hwnd,IDC_KEEP_DISPLAY,ReadBoolSetting(L"KeepDisplay",true)?BST_CHECKED:BST_UNCHECKED);
             CheckDlgButton(hwnd,IDC_PAUSE_FULLSCREEN,ReadBoolSetting(L"PauseFullscreen",false)?BST_CHECKED:BST_UNCHECKED);
             CheckDlgButton(hwnd,IDC_LOGGING,ReadBoolSetting(L"Logging",false)?BST_CHECKED:BST_UNCHECKED);
+            CheckDlgButton(hwnd,IDC_ALWAYS_MOVE,ReadBoolSetting(L"AlwaysMove",false)?BST_CHECKED:BST_UNCHECKED);
             {
                 wchar_t profileBuf[16]{};
                 GetPrivateProfileStringW(L"MouseMover", L"Profile", L"0",
@@ -4281,7 +4455,7 @@ HWND startButton =
                 L"STATIC",
                 L"",
                 WS_CHILD | WS_VISIBLE | SS_CENTER,
-                40, 820, 425, 22,
+                40, 840, 425, 22,
                 hwnd, nullptr, nullptr, nullptr
             );
 
@@ -4529,6 +4703,10 @@ HWND startButton =
 
         case WM_TIMER:
         {
+            // Windows ACTIVE/IDLE display disabled.
+            // if (wParam == TIMER_STOPPED_ACTIVITY)
+            //     UpdateWindowsIdleStatus();
+
             if (wParam == TIMER_MATRIX_RAIN)
             {
                 if (g_matrixTheme)
@@ -4701,6 +4879,7 @@ HWND startButton =
                 case IDC_KEEP_DISPLAY:
                 case IDC_PAUSE_FULLSCREEN:
                 case IDC_LOGGING:
+                case IDC_ALWAYS_MOVE:
                 case IDC_MON:
                 case IDC_TUE:
                 case IDC_WED:
@@ -5169,7 +5348,7 @@ int WINAPI WinMain(
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             520,
-            870,
+            910,
             nullptr,
             nullptr,
             instance,
