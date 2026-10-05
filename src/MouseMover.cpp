@@ -5092,10 +5092,16 @@ HWND startButton =
 
                 case ID_TRAY_EXIT:
                 {
-                    // Stop the worker while the window and tray resources are
-                    // still valid. This is especially important in Matrix mode,
-                    // where the worker can still update the dynamic tray icon
-                    // during its final cleanup.
+                    // Preserve the state that should be restored on the next
+                    // application start. StopApplication(false) changes
+                    // g_running to false, so settings must be saved BEFORE it.
+                    const bool resumeOnNextStart = g_running.load();
+
+                    // Save all current GUI changes and the original ACTIVE /
+                    // NOT ACTIVE state before stopping the worker.
+                    SaveSettings(resumeOnNextStart);
+
+                    // Stop the worker without overwriting Running in settings.ini.
                     StopApplication(false);
 
                     // Remove the notification icon before destroying the window.
@@ -5352,10 +5358,13 @@ HWND startButton =
 
             RemoveKeyboardHook();
 
-            // Save all current controls BEFORE StopApplication() changes
-            // g_running to false. This also preserves "Running=1" when the
-            // application is closed while active, so it can resume next time.
-            SaveSettings(g_running);
+            // Save current controls only if shutdown did not already stop the
+            // application. Tray Exit saves the original running state before
+            // StopApplication(false), so do not overwrite Running=1 with 0 here.
+            if (g_running)
+            {
+                SaveSettings(true);
+            }
 
             StopApplication(
                 false
