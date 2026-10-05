@@ -65,7 +65,8 @@ enum ControlId
     IDC_OPEN_LOG,
     IDC_THEME,
     IDC_PROFILE,
-    IDC_ALWAYS_MOVE
+    IDC_ALWAYS_MOVE,
+    IDC_CTRL_BEFORE_MOVE
 };
 
 // ============================================================
@@ -75,6 +76,7 @@ enum ControlId
 #define WM_TRAYICON  (WM_APP + 1)
 #define WM_STATUS    (WM_APP + 2)
 #define WM_COUNTDOWN (WM_APP + 3)
+#define WM_STATS_UPDATE (WM_APP + 20)
 
 // ============================================================
 // Tray menu IDs
@@ -126,6 +128,7 @@ static HWND g_preventSleepUi = nullptr;
 static HWND g_keepDisplayUi = nullptr;
 static HWND g_pauseFullscreenUi = nullptr;
 static HWND g_loggingUi = nullptr;
+static HWND g_ctrlBeforeMoveUi = nullptr;
 static HWND g_alwaysMoveUi = nullptr;
 static HWND g_statsUi = nullptr;
 static HWND g_resetUi = nullptr;
@@ -441,6 +444,8 @@ void UpdateLanguage()
     if(g_keepDisplayUi) SetWindowTextW(g_keepDisplayUi,T(L"Nechat displej zapnutý",L"Keep display on"));
     if(g_pauseFullscreenUi) SetWindowTextW(g_pauseFullscreenUi,T(L"Pozastavit ve fullscreen",L"Pause on fullscreen"));
     if(g_loggingUi) SetWindowTextW(g_loggingUi,T(L"Diagnostický log",L"Diagnostic log"));
+    if(g_ctrlBeforeMoveUi) SetWindowTextW(g_ctrlBeforeMoveUi,
+        T(L"Stisknout Ctrl před pohybem myši", L"Press Ctrl before mouse movement"));
     if(g_alwaysMoveUi) SetWindowTextW(g_alwaysMoveUi,
         T(L"Stálý pohyb (ignorovat časový plán)", L"Always move (ignore schedule)"));
     if(g_aboutUi) SetWindowTextW(g_aboutUi,
@@ -1120,6 +1125,7 @@ void SaveCurrentProfileSettings()
     writeBool(L"KeepDisplay", IDC_KEEP_DISPLAY);
     writeBool(L"PauseFullscreen", IDC_PAUSE_FULLSCREEN);
     writeBool(L"Logging", IDC_LOGGING);
+    writeBool(L"CtrlBeforeMove", IDC_CTRL_BEFORE_MOVE);
     writeBool(L"AlwaysMove", IDC_ALWAYS_MOVE);
 
     const wchar_t* dayKeys[7] =
@@ -1198,6 +1204,7 @@ void LoadProfileSettings(int profile)
     loadBool(L"KeepDisplay", IDC_KEEP_DISPLAY, globalBool(L"KeepDisplay", true));
     loadBool(L"PauseFullscreen", IDC_PAUSE_FULLSCREEN, globalBool(L"PauseFullscreen", false));
     loadBool(L"Logging", IDC_LOGGING, globalBool(L"Logging", false));
+    loadBool(L"CtrlBeforeMove", IDC_CTRL_BEFORE_MOVE, globalBool(L"CtrlBeforeMove", true));
     loadBool(L"AlwaysMove", IDC_ALWAYS_MOVE, globalBool(L"AlwaysMove", false));
 
     const wchar_t* dayKeys[7] =
@@ -1663,12 +1670,12 @@ bool ValidateSettings(bool showMessage)
 
     end = nullptr;
     long pixels = wcstol(GetControlText(g_pixels).c_str(), &end, 10);
-    ok = ok && end && *end == L'\0' && pixels >= 1 && pixels <= 5000;
+    ok = ok && end && *end == L'\0' && pixels >= 0 && pixels <= 5000;
 
     if (!ok && showMessage)
         MessageBoxW(g_hwnd,
-            T(L"Zkontroluj čas HH:MM, interval 1–86400 a pohyb 1–5000 pixelů.",
-              L"Check HH:MM times, interval 1–86400 and movement 1–5000 pixels."),
+            T(L"Zkontroluj čas HH:MM, interval 1–86400 a pohyb 0–5000 pixelů.",
+              L"Check HH:MM times, interval 1–86400 and movement 0–5000 pixels."),
             L"MOUSE MOVER // MATRIX", MB_OK | MB_ICONWARNING);
 
     return ok;
@@ -1689,27 +1696,16 @@ std::wstring FormatMMSS(int seconds);
 
 void UpdateTrayTooltip()
 {
-    if (!g_nid.hWnd) return;
-    std::wstring tip;
-    if (!g_running)
-    {
-        tip = T(L"Mouse Mover • VYPNUTO", L"Mouse Mover • STOPPED");
-    }
-    else if (g_sessionLocked)
-    {
-        tip = T(L"Mouse Mover • ZAMKNUTO • PAUZA", L"Mouse Mover • LOCKED • PAUSED");
-    }
-    else
-    {
-        int remaining = g_remainingSeconds.load();
-        tip = T(L"Mouse Mover • AKTIVNÍ", L"Mouse Mover • ACTIVE");
-        tip += L" • " + GetProfileDisplayName(g_activeProfile);
-        if (remaining >= 0)
-            tip += L" • " + FormatMMSS(remaining);
-    }
-    wcsncpy_s(g_nid.szTip, tip.c_str(), _TRUNCATE);
-    g_nid.uFlags = NIF_TIP | NIF_MESSAGE | NIF_ICON;
-    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    if (!g_nid.hWnd)
+        return;
+
+    const wchar_t* tip = g_running
+        ? L"Mouse Mover - ACTIVE"
+        : L"Mouse Mover - NOT ACTIVE";
+
+    wcsncpy_s(g_nid.szTip, tip, _TRUNCATE);
+
+    // Green icon while active, red icon while inactive.
     UpdateTrayIconForState();
 }
 
@@ -1724,6 +1720,8 @@ void ResetSettingsToDefaults()
     CheckDlgButton(g_hwnd, IDC_KEEP_DISPLAY, BST_CHECKED);
     CheckDlgButton(g_hwnd, IDC_PAUSE_FULLSCREEN, BST_UNCHECKED);
     CheckDlgButton(g_hwnd, IDC_LOGGING, BST_UNCHECKED);
+    CheckDlgButton(g_hwnd, IDC_CTRL_BEFORE_MOVE, BST_CHECKED);
+    CheckDlgButton(g_hwnd, IDC_ALWAYS_MOVE, BST_UNCHECKED);
     for (int i=0;i<7;++i)
         if (g_dayChecks[i]) SendMessageW(g_dayChecks[i], BM_SETCHECK, BST_CHECKED, 0);
     SaveSettings(g_running);
@@ -1955,6 +1953,8 @@ void RecordActivity(const wchar_t* csType, const wchar_t* enType)
     );
 }
 
+static void PressCtrlBeforeAutomaticMove();
+
 void PerformTestMovement()
 {
     POINT original{};
@@ -1969,8 +1969,28 @@ void PerformTestMovement()
     );
 
     int pixels = _wtoi(pixelBuffer);
-    if (pixels < 1)
-        pixels = 1;
+    if (pixels < 0)
+        pixels = 0;
+
+    // TEST mirrors the real automatic action: when enabled, Ctrl is pressed
+    // immediately before the attempted cursor movement (also for 0 px).
+    if (g_hwnd &&
+        IsDlgButtonChecked(g_hwnd, IDC_CTRL_BEFORE_MOVE) == BST_CHECKED)
+    {
+        PressCtrlBeforeAutomaticMove();
+    }
+
+    // 0 pixels is a valid setting. Do not enter the random non-zero
+    // movement loop below, because dist(0, 0) can only return 0/0.
+    // Treat TEST as a successful zero-distance test instead.
+    if (pixels == 0)
+    {
+        g_ignoreMouseUntilTick = GetTickCount64() + 500;
+        g_lastObservedCursor = original;
+        g_haveLastObservedCursor = true;
+        RecordActivity(L"Test pohybu (0 px)", L"Movement test (0 px)");
+        return;
+    }
 
     static std::mt19937 rng(
         static_cast<unsigned int>(
@@ -2302,7 +2322,7 @@ void SaveSettings(
         const wchar_t* keys[] = {
             L"StartTime", L"EndTime", L"Interval", L"Pixels",
             L"AutoStart", L"Tray",
-            L"PreventSleep", L"KeepDisplay", L"PauseFullscreen", L"Logging", L"AlwaysMove",
+            L"PreventSleep", L"KeepDisplay", L"PauseFullscreen", L"Logging", L"CtrlBeforeMove", L"AlwaysMove",
             L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat", L"Sun"
         };
 
@@ -2412,6 +2432,7 @@ void SaveSettings(
     saveBool(L"KeepDisplay", IDC_KEEP_DISPLAY);
     saveBool(L"PauseFullscreen", IDC_PAUSE_FULLSCREEN);
     saveBool(L"Logging", IDC_LOGGING);
+    saveBool(L"CtrlBeforeMove", IDC_CTRL_BEFORE_MOVE);
     saveBool(L"AlwaysMove", IDC_ALWAYS_MOVE);
 
     const wchar_t* dayKeys[7] = {L"Mon",L"Tue",L"Wed",L"Thu",L"Fri",L"Sat",L"Sun"};
@@ -2453,6 +2474,7 @@ void SaveSettings(
         profileBool(L"KeepDisplay", IDC_KEEP_DISPLAY);
         profileBool(L"PauseFullscreen", IDC_PAUSE_FULLSCREEN);
         profileBool(L"Logging", IDC_LOGGING);
+        profileBool(L"CtrlBeforeMove", IDC_CTRL_BEFORE_MOVE);
         profileBool(L"AlwaysMove", IDC_ALWAYS_MOVE);
 
         const wchar_t* profileDayKeys[7] =
@@ -2637,25 +2659,37 @@ void PostCountdown(
 
 static void PressCtrlBeforeAutomaticMove()
 {
-    INPUT inputs[2]{};
+    INPUT down{};
+    down.type = INPUT_KEYBOARD;
+    down.ki.wVk = VK_CONTROL;
 
-    inputs[0].type = INPUT_KEYBOARD;
-    inputs[0].ki.wVk = VK_CONTROL;
+    INPUT up{};
+    up.type = INPUT_KEYBOARD;
+    up.ki.wVk = VK_CONTROL;
+    up.ki.dwFlags = KEYEVENTF_KEYUP;
 
-    inputs[1].type = INPUT_KEYBOARD;
-    inputs[1].ki.wVk = VK_CONTROL;
-    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    // Send down/up separately so the key-up is still attempted even if the
+    // first injection fails. This avoids leaving Ctrl logically held down.
+    const UINT sentDown = SendInput(1, &down, sizeof(INPUT));
+    const UINT sentUp   = SendInput(1, &up, sizeof(INPUT));
 
-    SendInput(2, inputs, sizeof(INPUT));
+    if (sentDown != 1 || sentUp != 1)
+    {
+        WriteLog(T(
+            L"VAROVÁNÍ: nepodařilo se kompletně odeslat Ctrl",
+            L"WARNING: Ctrl injection was not completed"
+        ));
+    }
 
-    // Give Windows a brief moment to process Ctrl before moving the cursor.
     Sleep(30);
 }
 
 void MoveCursor()
 {
-    // Press and release Ctrl immediately before every automatic movement.
-    PressCtrlBeforeAutomaticMove();
+    // Optional Ctrl press before automatic movement. The checkbox is
+    // persistent in settings.ini and defaults to enabled for compatibility.
+    if (g_hwnd && IsDlgButtonChecked(g_hwnd, IDC_CTRL_BEFORE_MOVE) == BST_CHECKED)
+        PressCtrlBeforeAutomaticMove();
 
     POINT originalPosition{};
 
@@ -2668,9 +2702,15 @@ void MoveCursor()
         ReadNumber(
             g_pixels,
             5,
-            1,
-            500
+            0,
+            5000
         );
+
+    // 0 pixels intentionally means no cursor displacement. Ctrl (when enabled)
+    // has already been pressed above, so this setting can be used as
+    // "Ctrl only" without moving the mouse.
+    if (pixels == 0)
+        return;
 
     // Generate a random direction.
     //
@@ -2871,7 +2911,7 @@ void WorkerThread()
         {
             RecordActivity(L"Pohyb myši", L"Mouse movement");
             ++g_resets;
-            UpdateStats();
+            PostMessageW(g_hwnd, WM_STATS_UPDATE, 0, 0);
             remaining =
                 ReadNumber(
                     g_interval,
@@ -2892,7 +2932,7 @@ void WorkerThread()
         {
             RecordActivity(L"Klávesnice", L"Keyboard");
             ++g_resets;
-            UpdateStats();
+            PostMessageW(g_hwnd, WM_STATS_UPDATE, 0, 0);
             remaining =
                 ReadNumber(
                     g_interval,
@@ -2984,10 +3024,29 @@ void WorkerThread()
                         T(L"AKTIVNÍ • pohybuji kurzorem", L"ACTIVE • moving cursor")
                     );
 
+                    // 0 px is a valid "Ctrl-only" action. Do not count it
+                    // as an actual cursor movement in statistics.
+                    const int configuredPixels =
+                        ReadNumber(g_pixels, 5, 0, 5000);
+
                     MoveCursor();
-                    ++g_autoMoves;
-                    UpdateStats();
-                    WriteLog(T(L"Automatický pohyb kurzoru", L"Automatic cursor movement"));
+
+                    if (configuredPixels > 0)
+                    {
+                        ++g_autoMoves;
+                        PostMessageW(g_hwnd, WM_STATS_UPDATE, 0, 0);
+                        WriteLog(T(
+                            L"Automatický pohyb kurzoru",
+                            L"Automatic cursor movement"
+                        ));
+                    }
+                    else
+                    {
+                        WriteLog(T(
+                            L"Automatická akce bez pohybu kurzoru (0 px)",
+                            L"Automatic action without cursor movement (0 px)"
+                        ));
+                    }
 
                     // Save new cursor position immediately.
                     //
@@ -3414,6 +3473,67 @@ void StartApplication()
 
 
 // ============================================================
+// Join worker without blocking the GUI message queue
+//
+// WorkerThread reads several controls through Win32 functions such as
+// IsDlgButtonChecked/GetWindowText. Those can use synchronous window messages.
+// A plain std::thread::join() on the GUI thread can therefore deadlock:
+// GUI waits for worker, worker waits for GUI. Keep pumping messages until the
+// worker handle is signalled, then perform the normal join.
+// ============================================================
+
+static void JoinWorkerWithoutGuiDeadlock()
+{
+    if (!g_worker.joinable())
+        return;
+
+    HANDLE workerHandle =
+        reinterpret_cast<HANDLE>(g_worker.native_handle());
+
+    for (;;)
+    {
+        DWORD result = MsgWaitForMultipleObjects(
+            1,
+            &workerHandle,
+            FALSE,
+            INFINITE,
+            QS_ALLINPUT
+        );
+
+        if (result == WAIT_OBJECT_0)
+            break;
+
+        if (result == WAIT_OBJECT_0 + 1)
+        {
+            MSG msg{};
+
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
+            {
+                if (msg.message == WM_QUIT)
+                {
+                    // Do not consume WM_QUIT permanently. Put it back so the
+                    // main message loop can see it after shutdown completes.
+                    PostQuitMessage(static_cast<int>(msg.wParam));
+                    continue;
+                }
+
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+
+            continue;
+        }
+
+        // Unexpected wait failure: fall back to the standard join.
+        break;
+    }
+
+    if (g_worker.joinable())
+        g_worker.join();
+}
+
+
+// ============================================================
 // Stop application
 // ============================================================
 
@@ -3436,10 +3556,10 @@ void StopApplication(
     g_cv.notify_all();
 
 
-    if (g_worker.joinable())
-    {
-        g_worker.join();
-    }
+    // Do not block the GUI thread with a plain join here. WorkerThread
+    // accesses GUI controls and may be waiting for this thread to process
+    // a synchronous Windows message.
+    JoinWorkerWithoutGuiDeadlock();
 
 
     EnableWindow(
@@ -3521,11 +3641,10 @@ void ShowTrayMenu()
         return;
 
 
+    // Right-click tray menu shows only the state; no countdown/time.
     std::wstring trayState = g_running
-        ? T(L"Stav: AKTIVNÍ", L"Status: ACTIVE")
-        : T(L"Stav: VYPNUTO", L"Status: STOPPED");
-    if (g_running && g_remainingSeconds.load() >= 0)
-        trayState += L" • " + FormatMMSS(g_remainingSeconds.load());
+        ? L"ACTIVE"
+        : L"NOT ACTIVE";
 
     AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, trayState.c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -4172,22 +4291,31 @@ LRESULT CALLBACK WindowProc(
                 WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 265,502,230,24,
                 hwnd,reinterpret_cast<HMENU>(IDC_LOGGING),nullptr,nullptr);
 
+            g_ctrlBeforeMoveUi = CreateWindowW(L"BUTTON",
+                T(L"Stisknout Ctrl před pohybem myši",
+                  L"Press Ctrl before mouse movement"),
+                WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 40,532,425,24,
+                hwnd,reinterpret_cast<HMENU>(IDC_CTRL_BEFORE_MOVE),nullptr,nullptr);
+
             const wchar_t* daysCs[7]={L"Po",L"Út",L"St",L"Čt",L"Pá",L"So",L"Ne"};
             const wchar_t* daysEn[7]={L"Mo",L"Tu",L"We",L"Th",L"Fr",L"Sa",L"Su"};
             for(int i=0;i<7;++i)
                 g_dayChecks[i]=CreateWindowW(L"BUTTON",g_english?daysEn[i]:daysCs[i],
-                    WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,40+i*61,542,55,24,
+                    WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,40+i*61,572,55,24,
                     hwnd,reinterpret_cast<HMENU>(IDC_MON+i),nullptr,nullptr);
 
             g_statsUi=CreateWindowW(L"STATIC",L"",WS_CHILD|WS_VISIBLE,
-                40,574,425,24,hwnd,reinterpret_cast<HMENU>(IDC_STATS),nullptr,nullptr);
+                40,604,425,24,hwnd,reinterpret_cast<HMENU>(IDC_STATS),nullptr,nullptr);
 
             g_lastActivityUi =
                 CreateWindowW(
                     L"STATIC",
                     L"",
-                    WS_CHILD | WS_VISIBLE,
-                    40, 606, 425, 28,
+                    WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
+                    // One line is enough for "Poslední aktivita: ... • HH:MM:SS".
+                    // SS_LEFTNOWORDWRAP prevents the text from wrapping behind
+                    // the TEST/LOG/RESET/INFO button row.
+                    40, 636, 425, 24,
                     hwnd,
                     reinterpret_cast<HMENU>(IDC_LAST_ACTIVITY),
                     nullptr,
@@ -4199,7 +4327,7 @@ LRESULT CALLBACK WindowProc(
                     L"BUTTON",
                     L"TEST",
                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    40, 640, 135, 36,
+                    40, 670, 135, 36,
                     hwnd,
                     reinterpret_cast<HMENU>(IDC_TEST),
                     nullptr,
@@ -4215,7 +4343,7 @@ HWND startButton =
                     WS_VISIBLE |
                     BS_OWNERDRAW,
                     40,
-                    688,
+                    718,
                     195,
                     44,
                     hwnd,
@@ -4235,7 +4363,7 @@ HWND startButton =
                     WS_VISIBLE |
                     WS_DISABLED,
                     270,
-                    688,
+                    718,
                     195,
                     44,
                     hwnd,
@@ -4248,13 +4376,13 @@ HWND startButton =
 
 
             g_openLogUi=CreateWindowW(L"BUTTON",T(L"[ LOG ]",L"[ LOG ]"),
-                WS_CHILD|WS_VISIBLE,185,640,105,36,hwnd,
+                WS_CHILD|WS_VISIBLE,185,670,105,36,hwnd,
                 reinterpret_cast<HMENU>(IDC_OPEN_LOG),nullptr,nullptr);
             g_resetUi=CreateWindowW(L"BUTTON",L"RESET",
-                WS_CHILD|WS_VISIBLE,300,640,75,36,hwnd,
+                WS_CHILD|WS_VISIBLE,300,670,75,36,hwnd,
                 reinterpret_cast<HMENU>(IDC_RESET),nullptr,nullptr);
             g_aboutUi=CreateWindowW(L"BUTTON",T(L"[ INFO ]",L"[ INFO ]"),
-                WS_CHILD|WS_VISIBLE,385,640,110,36,hwnd,
+                WS_CHILD|WS_VISIBLE,385,670,110,36,hwnd,
                 reinterpret_cast<HMENU>(IDC_ABOUT),nullptr,nullptr);
 
             g_startButtonUi = startButton;
@@ -4273,7 +4401,7 @@ HWND startButton =
                     WS_VISIBLE |
                     SS_CENTER,
                     40,
-                    744,
+                    774,
                     425,
                     38,
                     hwnd,
@@ -4297,7 +4425,7 @@ HWND startButton =
                     WS_VISIBLE |
                     SS_CENTER,
                     40,
-                    790,
+                    820,
                     425,
                     38,
                     hwnd,
@@ -4410,6 +4538,7 @@ HWND startButton =
             CheckDlgButton(hwnd,IDC_KEEP_DISPLAY,ReadBoolSetting(L"KeepDisplay",true)?BST_CHECKED:BST_UNCHECKED);
             CheckDlgButton(hwnd,IDC_PAUSE_FULLSCREEN,ReadBoolSetting(L"PauseFullscreen",false)?BST_CHECKED:BST_UNCHECKED);
             CheckDlgButton(hwnd,IDC_LOGGING,ReadBoolSetting(L"Logging",false)?BST_CHECKED:BST_UNCHECKED);
+            CheckDlgButton(hwnd,IDC_CTRL_BEFORE_MOVE,ReadBoolSetting(L"CtrlBeforeMove",true)?BST_CHECKED:BST_UNCHECKED);
             CheckDlgButton(hwnd,IDC_ALWAYS_MOVE,ReadBoolSetting(L"AlwaysMove",false)?BST_CHECKED:BST_UNCHECKED);
             {
                 wchar_t profileBuf[16]{};
@@ -4455,7 +4584,7 @@ HWND startButton =
                 L"STATIC",
                 L"",
                 WS_CHILD | WS_VISIBLE | SS_CENTER,
-                40, 840, 425, 22,
+                40, 870, 425, 22,
                 hwnd, nullptr, nullptr, nullptr
             );
 
@@ -4879,6 +5008,7 @@ HWND startButton =
                 case IDC_KEEP_DISPLAY:
                 case IDC_PAUSE_FULLSCREEN:
                 case IDC_LOGGING:
+                case IDC_CTRL_BEFORE_MOVE:
                 case IDC_ALWAYS_MOVE:
                 case IDC_MON:
                 case IDC_TUE:
@@ -4962,6 +5092,15 @@ HWND startButton =
 
                 case ID_TRAY_EXIT:
                 {
+                    // Stop the worker while the window and tray resources are
+                    // still valid. This is especially important in Matrix mode,
+                    // where the worker can still update the dynamic tray icon
+                    // during its final cleanup.
+                    StopApplication(false);
+
+                    // Remove the notification icon before destroying the window.
+                    RemoveTrayIcon();
+
                     DestroyWindow(
                         hwnd
                     );
@@ -5000,6 +5139,12 @@ HWND startButton =
         // ----------------------------------------------------
         // Countdown message
         // ----------------------------------------------------
+
+        case WM_STATS_UPDATE:
+        {
+            UpdateStats();
+            return 0;
+        }
 
         case WM_COUNTDOWN:
         {
@@ -5184,7 +5329,11 @@ HWND startButton =
         case WM_DESTROY:
         {
             WTSUnRegisterSessionNotification(hwnd);
-            DestroyDynamicTrayIcons();
+
+            // Stop Matrix animation first so no more repaint work is queued.
+            KillTimer(hwnd, TIMER_MATRIX_RAIN);
+            g_matrixRain.clear();
+
             if (g_themeWindowBrush)
             {
                 DeleteObject(g_themeWindowBrush);
@@ -5201,9 +5350,6 @@ HWND startButton =
                 TIMER_STOPPED_ACTIVITY
             );
 
-            KillTimer(hwnd, TIMER_MATRIX_RAIN);
-            g_matrixRain.clear();
-
             RemoveKeyboardHook();
 
             // Save all current controls BEFORE StopApplication() changes
@@ -5215,8 +5361,11 @@ HWND startButton =
                 false
             );
 
-
+            // The tray icon must be removed before its dynamic HICON objects
+            // are destroyed. Otherwise Explorer can keep a stale Matrix icon
+            // and the process can appear hung in the notification area.
             RemoveTrayIcon();
+            DestroyDynamicTrayIcons();
 
 
             if (g_fontTitle) { DeleteObject(g_fontTitle); g_fontTitle = nullptr; }
@@ -5348,7 +5497,7 @@ int WINAPI WinMain(
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             520,
-            910,
+            940,
             nullptr,
             nullptr,
             instance,
